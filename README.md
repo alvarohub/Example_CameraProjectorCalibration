@@ -1,6 +1,13 @@
 Example_CameraProjectorCalibration
 ==================================
 
+How to use:
+
+
+
+
+Things to do:
+
 - pre-processing of acquired images with color based segmentation (this data should be in the pattern calibration file)
 - color picker 
 - 3d representation of camera/projector configuration in a separate viewport (with axis and mouse controlled rotation to check some things, like camera orientation, etc)
