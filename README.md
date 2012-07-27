@@ -10,7 +10,7 @@ The actual size of the board is not important. If you want to get real distances
 %YAML:1.0
 xCount: 4
 yCount: 5
-squareSize: 30  << -- here, size in cm of the elemental square
+squareSize: 30  << -- here, size in cm or mm of the elemental square
 posX: 400
 posY: 250
 patternType: 2
