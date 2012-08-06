@@ -19,7 +19,7 @@ const int minNumGoodBoards=15; // after this number of simultaneoulsy acquired "
 
 
 // ****** INITIAL MODE ******
-CalibState InitialMode=CAMERA_AND_PROJECTOR_PHASE1;//;CAMERA_ONLY;// AR_DEMO;//
+CalibState InitialMode=CAMERA_ONLY; //CAMERA_AND_PROJECTOR_PHASE1;//;// AR_DEMO;
 
 void testApp::setup() {
 	ofSetVerticalSync(true);
@@ -55,16 +55,20 @@ void testApp::setup() {
     ofEnableSmoothing();
     ofSetCircleResolution(30);
     
-	// Initialization of the state machine (note: THIS PROGRAM will mostly be a METHOD of a STEREO CALIBRATION CLASS)
+    // INITIAL MODE:
+    initialization(InitialMode);
+}
+
+void testApp::initialization(CalibState initialmode) {
+    // Initialization of the state machine (note: THIS PROGRAM will mostly be a METHOD of a STEREO CALIBRATION CLASS)
 	lastTime = 0;
 	active = true;
     newBoardAquired=false;
     dynamicProjection=false;
     dynamicProjectionInside=false;
     displayAR=false;
-    
-    // INITIAL MODE?
-    switch (InitialMode) {
+
+    switch (initialmode) {
         case CAMERA_ONLY: // (1) calibrate camera before anything else
             stateCalibration=CAMERA_ONLY;
             break;
@@ -98,7 +102,6 @@ void testApp::setup() {
             break;
     }
 }
-
 
 void testApp::update() {
 	cam.update();
@@ -368,6 +371,8 @@ void testApp::draw() {
     
     ofSetWindowPosition(0,0); 
     
+    // NOTE: we take the convention here of (0,0) at upper-left point (this is 
+    // the reverse of OpenGL)
     ofViewport(viewportComputer);
     glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
@@ -411,7 +416,7 @@ void testApp::draw() {
             break;
         case CAMERA_AND_PROJECTOR_PHASE1:
         case CAMERA_AND_PROJECTOR_PHASE2:
-            drawHighlightString(" *** CALIBRATING CAMERA + PROJECTOR ***", COMPUTER_DISP_WIDTH-200, 40, cyanPrint,  ofColor(255));
+            drawHighlightString(" *** CALIBRATING CAMERA + PROJECTOR ***", COMPUTER_DISP_WIDTH-400, 40, cyanPrint,  ofColor(255));
             
             // Extrinsics camera-projector:
             // NOTE: in the future, the object STEREO should have a flag "isReady" to test if it is possible to proceed with some things...
@@ -559,6 +564,12 @@ void testApp::draw() {
                 glMatrixMode(GL_MODELVIEW);
                 glLoadIdentity();
                 
+                // draw viewport limits:
+                ofSetLineWidth(5);
+                ofSetColor(255, 255, 255);
+                ofRect(0,0, viewportProjector.width, viewportProjector.height);
+
+                
                 // Project all corners of the printed chessboard using EXTRINSICS:
                 vector<Point2f> testPoints;
                 testPoints=calibrationProjector.createImagePointsFrom3dPoints(calibrationCamera.candidateObjectPoints,  calibrationCamera.candidateBoardRotation, calibrationCamera.candidateBoardTranslation, rotCamToProj, transCamToProj);
@@ -613,6 +624,12 @@ void testApp::loadExtrinsics(string filename, bool absolute) {
 // =========== THINGS THAT WILL BELONG TO THE STEREO-CALIBRATION OBJECT ====================
 
 void testApp::keyPressed(int key) {
+    
+    // Reset initialization:
+    if(key == '1') {initialization(CAMERA_ONLY);}
+    if(key == '2') {initialization(CAMERA_AND_PROJECTOR_PHASE1);}
+    if(key == '3') {initialization(AR_DEMO);}
+    
 	if(key == ' ') active = !active; 
     
     if (key=='p') dynamicProjection=!dynamicProjection; // toggle between fixed or dynamic (following) projection. 

@@ -523,8 +523,8 @@
 				DBD17E7415C106190032FB9A /* src */,
 			);
 			name = ofxCv2;
-			path = of_0071_osx_release/addons/ofxCv2;
-			sourceTree = DEVELOPER_DIR;
+			path = ../../../addons/ofxCv2;
+			sourceTree = "<group>";
 		};
 		DBD17E5D15C106190032FB9A /* libs */ = {
 			isa = PBXGroup;
