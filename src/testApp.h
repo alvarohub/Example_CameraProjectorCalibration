@@ -15,12 +15,15 @@
 // RESOLUTION OF CAMERA AND PROJECTOR: 
 // - ideally, this should also be in a file (in particular if we want to calibrate several cameras/projectors). 
 // Resolution of the projector:
-#define PROJ_WIDTH   848 // 800 
-#define PROJ_HEIGHT 480 // 600
+#define PROJ_WIDTH   800 
+#define PROJ_HEIGHT  600
 
 // Resolution of the camera (or at least resolution at which we want to calibrate it):
 #define CAM_WIDTH 640
 #define CAM_HEIGHT 480
+
+// for test:
+//#define MOVIE_PLAY
 
 // ==================================================================
 
@@ -43,7 +46,8 @@ public:
 	float diffMean;
 	
 	float lastTime;
-	bool active, displayAR;
+	bool manualAcquisition, manualGetImage;
+    bool displayAR;
     bool newBoardAquired;
     bool dynamicProjection;
     bool dynamicProjectionInside;

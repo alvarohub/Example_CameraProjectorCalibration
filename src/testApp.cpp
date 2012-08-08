@@ -3,23 +3,23 @@
 using namespace ofxCv;
 using namespace cv;
 
-const float diffThreshold = 3.0; // maximum amount of movement
-const float timeThreshold = 1.5; // minimum time between snapshots (seconds)
+const float diffThreshold = 3.0; // maximum amount of movement between successive frames (must be smaller in order to add a board)
+const float timeThreshold = 1.0; // minimum time between snapshots (seconds)
 
-const int preCalibrateCameraTimes = 15; // this is for calibrating the camera BEFORE starting projector calibration. 
+const int preCalibrateCameraTimes = 20; // this is for calibrating the camera BEFORE starting projector calibration. 
 const int startCleaningCamera = 8; // start cleaning outliers after this many samples (10 is ok...). Should be < than preCalibrateCameraTimes
-const float maxErrorCamera=0.3;
+const float maxErrorCamera=0.2;
 
-const float maxErrorProjector=0.30;
-const int startCleaningProjector = 6;
+const float maxErrorProjector=0.25;
+const int startCleaningProjector = 8;
 const int startDynamicProjectorPattern=5; // after this number of projector/camera calibration, the projection will start following the 
 // printed pattern to facilitate larger exploration of the field of view. If this number is larger than minNumGoodBoards, then this will never 
 // happen automatically. 
-const int minNumGoodBoards=15; // after this number of simultaneoulsy acquired "good" boards, IF the projector total reprojection error is smaller than a certain threshold, we end calibration (and move to AR mode automatically)
+const int minNumGoodBoards=20; // after this number of simultaneoulsy acquired "good" boards, IF the projector total reprojection error is smaller than a certain threshold, we end calibration (and move to AR mode automatically)
 
 
 // ****** INITIAL MODE ******
-CalibState InitialMode=CAMERA_ONLY; //CAMERA_AND_PROJECTOR_PHASE1;//;// AR_DEMO;
+CalibState InitialMode=AR_DEMO;//CAMERA_AND_PROJECTOR_PHASE1;//CAMERA_ONLY; //;// AR_DEMO;
 
 void testApp::setup() {
 	ofSetVerticalSync(true);
@@ -30,9 +30,10 @@ void testApp::setup() {
 	imitate(previous, cam);
 	imitate(diff, cam);
     
-    //eyeMovie.loadMovie("movies/ojo.mov");
-	//eyeMovie.play();
-    
+#ifdef MOVIE_PLAY
+    eyeMovie.loadMovie("movies/ojo.mov");
+	eyeMovie.play();
+#endif
     
     // (1) Load the pattern data to recognize, for camera and for projector:
     calibrationCamera.loadCalibrationShape("settingsPatternCamera.yml");
@@ -62,12 +63,15 @@ void testApp::setup() {
 void testApp::initialization(CalibState initialmode) {
     // Initialization of the state machine (note: THIS PROGRAM will mostly be a METHOD of a STEREO CALIBRATION CLASS)
 	lastTime = 0;
-	active = true;
+	
+    manualAcquisition = false; 
+    manualGetImage=false;
+    
     newBoardAquired=false;
     dynamicProjection=false;
     dynamicProjectionInside=false;
     displayAR=false;
-
+    
     switch (initialmode) {
         case CAMERA_ONLY: // (1) calibrate camera before anything else
             stateCalibration=CAMERA_ONLY;
@@ -105,30 +109,34 @@ void testApp::initialization(CalibState initialmode) {
 
 void testApp::update() {
 	cam.update();
-    //eyeMovie.idleMovie();
+#ifdef MOVIE_PLAY
+    eyeMovie.idleMovie();
+#endif
     
 	if(cam.isFrameNew()) {		
-		Mat camMat = toCv(cam);
+		Mat camMat = toCv(cam); // current image to process
+        
 		Mat prevMat = toCv(previous);
 		Mat diffMat = toCv(diff);
-      	
 		absdiff(prevMat, camMat, diffMat);	
+        diffMean = mean(Mat(mean(diffMat)))[0];
 		camMat.copyTo(prevMat);
-		
-		diffMean = mean(Mat(mean(diffMat)))[0];
-		
-		float curTime = ofGetElapsedTimef();
-        active=true;
         
-        //(a) First, add and preprocess the image (this will threshold, color segmentation, etc as specified in the pattern calibration files):
+		float curTime = ofGetElapsedTimef();
+        
+        //(a) First, add and preprocess the image (this will threshold, color segmentation, etc as specified in the pattern 
+        // calibration files). This is done regardless of the manual acquisition mode, because we want to be able to check 
+        // the pre-precess images. 
         calibrationCamera.addImageToProcess(camMat);
         calibrationProjector.addImageToProcess(camMat);
         
         //(b) detect the patterns, and perform calibration or stereo calibration:
         switch(stateCalibration) {
+                // CAMERA ONLY ---------------------------------------------------------------------------------------------
             case CAMERA_ONLY:
                 
-                if(active && curTime - lastTime > timeThreshold && diffMean < diffThreshold) {
+                if(( manualAcquisition && manualGetImage) ||
+                   (!manualAcquisition && (curTime - lastTime > timeThreshold && diffMean < diffThreshold) )) {
                     
                     if (calibrationCamera.generateCandidateImageObjectPoints()) {
                         
@@ -165,184 +173,241 @@ void testApp::update() {
                             stateCalibration=CAMERA_AND_PROJECTOR_PHASE1; 
                         }
                         
+                        // Reset timer, as well as manual flag:
                         lastTime = curTime;
-                        active=false;
+                        manualGetImage=false;
                     }
                     
                 }
                 break;
                 
-                // IMPORTANT: in case of camera/projector calibration, we need to proceed in TWO PHASES to give time to the projected image 
-                // to refresh before trying to detect it (in case of "dynamic projected pattern"). Otherwise we may be detecting the OLD projected
-                // pattern, but using the new image points. Which completely breaks the calibration of course. 
+                // CAMERA AND PROJECTOR ---------------------------------------------------------------------------------------------
+                // Notes: In case of camera/projector calibration, we need to proceed in TWO PHASES to give time to the projected image 
+                // to refresh before trying to detect it (in case of "dynamic projected pattern"). Otherwise we may be detecting the OLD 
+                // projected pattern, but using the newer image points (which completely breaks the calibration of course)
                 
-            case CAMERA_AND_PROJECTOR_PHASE1: // pre-detection of the printed pattern (to move the projected pattern around if necessary)
-                cout << " ****** PHASE 1 ********** " << endl;
-                
-                // Set the points for projector display (not adding them to the imagePoints vector yet), so the projector 
+            case CAMERA_AND_PROJECTOR_PHASE1: 
+                // PHASE 1 goal is just to set the projector image points to be projected, so the projector 
                 // will project something to be detected in the draw function. The first time, this is using the recorded pattern, but later 
                 // (as the projector gets calibrated) we can use some arbitrary points "closer" to the printed pattern.
-                // ATTN!! this test not ideal because CLEANING may change the number of boards in the list - BETTER TO TRACK THE CURRENT TOTAL 
-                // REPROJECTION ERROR? (this may be ok, IF the next board position is closer to the current one. Indeed, a good reprojection error
-                // for the projector can be attained in ONE try, but the extrinsics are not even computed!!)
-                if (calibrationProjector.size()==0) dynamicProjection=false; // this is necessary in case all the board are deleted because of large
-                // reprojection error. Then there is no board rot/translation computed form the point of view of the projector. 
+                // In this later case (dynamic pattern), if the printed pattern is not visible, then we won't go to phase 2. 
+                
+                cout << " ****** PHASE 1 ********** " << endl;
+                
+                
+                // Dynamic or static projection? :               
+                if (calibrationProjector.size()==0) dynamicProjection=false; // this is necessary in case all the board are deleted because 
+                // of large reprojection error (even if we FORCED dynamicProjection to true using the keyboard). In that case, there won't be 
+                // any board rot/translation computed form the point of view of the projector. 
                 else if (calibrationProjector.size()>startDynamicProjectorPattern) dynamicProjection=true; // note that dynamic projection can be set manually too, or using this threshold on the number of boards. 
                 
-                if (!dynamicProjection) {
+                // Now, set the IMAGE points of the projector, either using a stored pattern, or from the reprojected 3d points of the 
+                // printed chessboard.
+                if (dynamicProjection) {
+                    
+                    cout << "USING DYNAMIC PROJECTION PATTERN" << endl;
+                    
+                    // First, check if we can detect the printed pattern to reajust the projection
+                    // IMPORTANT NOTE: we may prefer AVOIDING the manual acquisition test or the timer, so as to move the 
+                    // projection in "real time":
+                  //  if(( manualAcquisition && manualGetImage) ||
+                  //     (!manualAcquisition && (curTime - lastTime > timeThreshold && diffMean < diffThreshold) )) {
+                        
+                        if  (calibrationCamera.generateCandidateImageObjectPoints()) { // generate image points from the detected pattern, and 
+                            //object points from the stored pattern, for the CAMERA.
+                            
+                            cout << "Printed pattern detected" << endl;
+                            
+                            // We assume now that the camera is well calibrated: do NOT recalibrate again, simply compute latest board pose:                        
+                            calibrationCamera.computeCandidateBoardPose();  
+                            
+                            // NOTE: we don't add anything to the board vector arrays FOR THE CAMERA (image/object) because we need to be sure
+                            // we also get this data for the projector calibration object before calling stereo calibration
+                            // However, we can already use the candidate points to show image and reprojection for that board.  
+                            
+                            // In this case, we can modify the candidate projector image points to follow the printed board if the projector has
+                            // been partially calibrated. This is important to effectively explore the "image space" for the projector, and 
+                            // improve the calibration. 
+                            // IMPORTANT: This can be done using the computed extrinsics, or the board rot/trans computed from the latest
+                            // projector calibration; we will use the latest board pose, in camera and projector coordinates, as well as 
+                            // the current post in camera coordinates, to deduce the current pose in projector coordinates: this is better than
+                            // using the current "global computed" extrinsics (which may not have been yet computed, or recently "cleaned"). 
+                            
+                            //(make a special function with "displacement" parameter to project inside or outside the printed pattern?):
+                            vector<Point3f> auxObjectPoints;
+                            Point3f posOrigin, axisX, axisY;  
+                            axisX=calibrationCamera.candidateObjectPoints[1]-calibrationCamera.candidateObjectPoints[0];
+                            axisY=calibrationCamera.candidateObjectPoints[calibrationCamera.myPatternShape.getPatternSize().width]-calibrationCamera.candidateObjectPoints[0];
+                            if (dynamicProjectionInside) 
+                                //pattern inside the printed chessboard:
+                                posOrigin=calibrationCamera.candidateObjectPoints[0]+(axisX-axisY)*0.5;
+                            else
+                                // pattern outside the printed chessboard:
+                                posOrigin=calibrationCamera.candidateObjectPoints[0]-axisY*(calibrationCamera.myPatternShape.getPatternSize().width-2);
+                            
+                            auxObjectPoints=Calibration::createObjectPointsDynamic(posOrigin, axisX, axisY, calibrationProjector.myPatternShape);
+                            // Note: a method "setCandidateDynamicObjectPoints" is not needed, because the actual candidate OBJECT points will be computed from the camera image. But perhaps it would be better to have it, to avoid calling a static method. 
+                            
+                            vector<Point2f> followingPatternImagePoints;
+                            // Remember: we will use the rot/trans of the PREVIOUS BOARD as stored by the projector calibration object, and
+                            // not the (yet not good) extrinsics, which is what we are looking for by the way. So, since we don't use the 
+                            // extrinsics, we need to determine the new rot/trans from the camera "delta" motion, which presumably, is quite 
+                            // good (camera is well calibrated). Note that even if the final pose in projector coordinates is not good, we don't
+                            // care: we are just trying to get the projected point "closer" to the printed pattern to facilitate "exploration"
+                            // of the space - points will we will precisely detected with the camera. 
+                            
+                            Mat Rc1, Tc1, Rc1inv, Tc1inv, Rc2, Tc2, Rp1, Tp1, Rp2, Tp2;
+                            // Previous bord position in projector coordinate frame:
+                            Rp1=calibrationProjector.boardRotations.back();
+                            Tp1=calibrationProjector.boardTranslations.back();
+                            // Previous board position in camera coordinate frame:
+                            Rc1=calibrationCamera.boardRotations.back();
+                            Tc1=calibrationCamera.boardTranslations.back();
+                            // Latest board position in camera coordiante frame (not yet in the vector list!!):
+                            Rc2=calibrationCamera.candidateBoardRotation;
+                            Tc2=calibrationCamera.candidateBoardTranslation;
+                            
+                            
+                            Mat auxRinv=Mat::eye(3,3,CV_32F);
+                            Rodrigues(Rc1,auxRinv);
+                            auxRinv=auxRinv.inv(); // or transpose, the same since it is a rotation matrix!
+                            Rodrigues(auxRinv, Rc1inv);
+                            Tc1inv=-auxRinv*Tc1;
+                            Mat Raux, Taux;
+                            composeRT(Rc2, Tc2, Rc1inv, Tc1inv, Raux, Taux);
+                            composeRT(Raux, Taux, Rp1, Tp1, Rp2, Tp2);
+                            
+                            followingPatternImagePoints=calibrationProjector.createImagePointsFrom3dPoints(auxObjectPoints, Rp2, Tp2); 
+                            // Set image points to display:
+                            calibrationProjector.setCandidateImagePoints(followingPatternImagePoints);
+                            
+                            // Then project, and go to phase 2:
+                            stateCalibration=CAMERA_AND_PROJECTOR_PHASE2; 
+                            
+                        } 
+                        else {
+                            cout << "Printed pattern not visible" << endl;
+                            cout << endl << "======= MOVE THE PRINTED PATTERN =====" << endl; 
+                            // Note: no need to reset manual acquisition of timer, because we know that we need to look for something. 
+                        }
+                        
+         //           }
+                    
+                }
+                else 
+                {
                     cout << "USING FIXED PROJECTION PATTERN" << endl;
                     //(a) Set the candidate points (for projection) using the fixed pattern:
                     calibrationProjector.setCandidateImagePoints(); 
                     
-                }  
-                
-                if  (calibrationCamera.generateCandidateImageObjectPoints()) { // generate image points from the detected pattern, and 
-                    //object points from the stored pattern.
-                    
-                    cout << "Printed pattern detected" << endl;
-                    
-                    // We assume now that the camera is well calibrated: do NOT recalibrate again, simply compute latest board pose:                        
-                    calibrationCamera.computeCandidateBoardPose();  
-                    
-                    //NOTE: we don't add anything to the board vector arrays FOR THE CAMERA (image/object) because we need to be sure
-                    // we also get this data for the projector calibration object before calling stereo calibration
-                    // However, we can already use the candidate points to show image and reprojection for that board.  
-                    
-                    
-                    if (dynamicProjection) {
-                        cout << "USING DYNAMIC PROJECTION PATTERN" << endl;
-                        //Modify the candidate projector image points to follow the printed board if the projector has been partially calibrated.
-                        // This is important to effectively explore the "image space" for the projector, and improve the calibration. 
-                        // (This can be done using the computed extrinsics, or the board rot/trans from the latest projector calibration)
-                        //(b) following the latest detected printed pattern (make a special function with displacement parameter):
-                        vector<Point3f> auxObjectPoints;
-                        Point3f posOrigin, axisX, axisY;  
-                        axisX=calibrationCamera.candidateObjectPoints[1]-calibrationCamera.candidateObjectPoints[0];
-                        axisY=calibrationCamera.candidateObjectPoints[calibrationCamera.myPatternShape.getPatternSize().width]-calibrationCamera.candidateObjectPoints[0];
-                        if (dynamicProjectionInside) 
-                            //pattern inside the printed chessboard:
-                            posOrigin=calibrationCamera.candidateObjectPoints[0]+(axisX-axisY)*0.5;
-                        else
-                            // pattern outside the printed chessboard:
-                            posOrigin=calibrationCamera.candidateObjectPoints[0]-axisY*(calibrationCamera.myPatternShape.getPatternSize().width-2);
-                        
-                        auxObjectPoints=Calibration::createObjectPointsDynamic(posOrigin, axisX, axisY, calibrationProjector.myPatternShape);
-                        // Note: a method "setCandidateDynamicObjectPoints" is not needed, because the actual candidate OBJECT points will be computed from the camera image. But perhaps it would be better to have it, to avoid calling a static method. 
-                        
-                        vector<Point2f> followingPatternImagePoints;
-                        // ATTN!!! the new position of the board should not differ much form the previous one!!! REMEMBER that we will use the  
-                        // rot/trans of the PREVIOUS BOARD as stored by the projector calibration object. Since we don't use the extrinsics, 
-                        // we need to determine the new rot/trans from the camera "delta" motion.
-                        
-                        Mat Rc1, Tc1, Rc1inv, Tc1inv, Rc2, Tc2, Rp1, Tp1, Rp2, Tp2;
-                        // Previous bord position in projector coordinate frame:
-                        Rp1=calibrationProjector.boardRotations.back();
-                        Tp1=calibrationProjector.boardTranslations.back();
-                        // Previous board position in camera coordinate frame:
-                        Rc1=calibrationCamera.boardRotations.back();
-                        Tc1=calibrationCamera.boardTranslations.back();
-                        // Latest board position in camera coordiante frame (not yet in the vector list!!):
-                        Rc2=calibrationCamera.candidateBoardRotation;
-                        Tc2=calibrationCamera.candidateBoardTranslation;
-                        
-                        
-                        Mat auxRinv=Mat::eye(3,3,CV_32F);
-                        Rodrigues(Rc1,auxRinv);
-                        auxRinv=auxRinv.inv(); // or transpose, the same since it is a rotation matrix!
-                        Rodrigues(auxRinv, Rc1inv);
-                        Tc1inv=-auxRinv*Tc1;
-                        Mat Raux, Taux;
-                        composeRT(Rc2, Tc2, Rc1inv, Tc1inv, Raux, Taux);
-                        composeRT(Raux, Taux, Rp1, Tp1, Rp2, Tp2);
-                        
-                        
-                        followingPatternImagePoints=calibrationProjector.createImagePointsFrom3dPoints(auxObjectPoints, Rp2, Tp2); 
-                        // Set image points to display:
-                        calibrationProjector.setCandidateImagePoints(followingPatternImagePoints);
-                    }
-                    
+                    // Project, and go to phase 2:
                     stateCalibration=CAMERA_AND_PROJECTOR_PHASE2; 
-                    
-                }
-                else {
-                    cout << "Printed pattern not visible" << endl;
-                    cout << endl << "======= MOVE THE PRINTED PATTERN =====" << endl; 
-                }
+                }      
+                
                 break;
                 
-            case  CAMERA_AND_PROJECTOR_PHASE2: // detection of the projected pattern
-                // (only if there is not much amount of movement -normally we should re-acquire the camera image/object and rot/trans, to 
-                // minimize motion. To do...). 
+            case  CAMERA_AND_PROJECTOR_PHASE2: 
+                // PHASE 2: here, we will check if BOTH camera and projector patterns are visible in the current acquired image. 
+                // IF NOT, then we will revert to phase one:
+                cout << " ****** PHASE 2 ********** " << endl;
                 
-                if (active && curTime - lastTime > timeThreshold && diffMean < diffThreshold) {
+                if(( manualAcquisition && manualGetImage) ||
+                   (!manualAcquisition && (curTime - lastTime > timeThreshold && diffMean < diffThreshold) )) {
                     
-                    cout << " ****** PHASE 2 ********** " << endl;
-                    if (calibrationProjector.generateCandidateObjectPoints(calibrationCamera)) {
-                        // Attention: generateCandidateObjectPoints compute the candidate objectPoints (if these are detected by the camera), but not the image points. These were assumed to be set already on the projector calibration object (and displayed!). 
+                    cout << "Trying to detect projected and printed patterns simultaneously:" << endl;
+                    
+                    // First, detect printed pattern and compute candidate board pose:
+                    if (calibrationCamera.generateCandidateImageObjectPoints()) {
+                        cout << "Printed pattern detected." << endl;
                         
-                        cout << "Printed and projected pattern detected simultaneously" << endl;
+                        calibrationCamera.computeCandidateBoardPose();  
                         
-                        // If the object points for the projector were detected, add those points as well as the image points to the
-                        // list of boards image/object for BOTH the camera and projector calibration object, including the rotation and 
-                        // translation vector for the camera frame. 
-                        
-                        // add to CAMERA board list (only for stereo calibration):
-                        calibrationCamera.addCandidateImagePoints();
-                        calibrationCamera.addCandidateObjectPoints();
-                        calibrationCamera.addCandidateBoardPose();
-                        
-                        // add to PROJECTOR board list (for projector recalibration and stereo calibration):
-                        calibrationProjector.addCandidateImagePoints();
-                        calibrationProjector.addCandidateObjectPoints();
-                        // Note: the rotation and translation vectors for the projector are not yet updated :these CANNOT 
-                        // properly be computed using PnP algorithm (as calibrationProjector.computeCandidateBoardPose()), because we are 
-                        // precisely trying to get the projector instrinsics! This will be done by the calibrateProj() method...
-                        
-                        cout << "Re-calibrating projector..." << endl;
-                        // PUT THIS IN ANOTHER THREAD????
-                        calibrationProjector.calibrate(); // this will recompute the projector instrinsics, as well as the board translation and rotation for all the boards, including the latest one. NOTE: it will also update the candidateBoardRotation and candidateBoardTranslation just because we may want these matrices for drawing (but we don't need to "add" them to the vector lists, because this is already done by the openCV calibration method). 
-                        cout << "Projector re-calibrated." << endl;
-                        
-                        
-                        // Cleaning: this needs to be done SIMULTANEOUSLY for projector and camera. 
-                        // However, the test is only done on the projector reprojection error if the camera intrinsics are fixed (because the 
-                        // stereo calibration will be done by generating image points for the camera based only on the OBJECT POINTS OF THE PROJECTOR)
-                        if(calibrationProjector.size() > startCleaningProjector) {
-                            calibrationProjector.simultaneousClean(calibrationCamera, maxErrorProjector);
-                        }
-                        
-                        // Now we can run the stereo calibration (output: rotCamToProj and transCamToProj). Note: we call stereo calibration
-                        // with FIXED INTRINSICS for both the camera and projector. 
-                        // NOTE: perhaps we can start running this after a few projector calibrations????
-                        calibrationProjector.stereoCalibrationCameraProjector(calibrationCamera, rotCamToProj, transCamToProj);
-                        
-                        // SAVE THE INTRINSICS and EXTRINSINCS when TOTAL reprojection error is lower than a certain threshold (this is 
-                        // automatically assured if we called simultaneousClean before this lines of code), 
-                        // and when we get a sufficiently large amount of boards, and move to AR_DEMO:
-                        if (calibrationProjector.size()>minNumGoodBoards) {
-                            calibrationProjector.save("calibrationProjector.yml"); 
-                            saveExtrinsics("CameraProjectorExtrinsics.yml");
-                            stateCalibration=AR_DEMO; 
-                        } else {
-                            // REVERT TO PHASE1 (and indicate that a "stereo board" was properly aquired)
+                        // If this succeeded, use this board pose and the camera to detect the candidate object points for the projector:
+                        if (calibrationProjector.generateCandidateObjectPoints(calibrationCamera)) {
+                            //Note: generateCandidateObjectPoints compute the candidate objectPoints (if these are detected by the camera), but not the image points. These were assumed to be set already on the projector calibration object (and displayed!). 
+                            
+                            cout << "Projected pattern detected" << endl;
+                            
+                            // If the object points for the projector were detected, add those points as well as the image points to the
+                            // list of boards image/object for BOTH the camera and projector calibration object, including the rotation and 
+                            // translation vector for the camera frame: 
+                            
+                            // add to CAMERA board list (only for stereo calibration):
+                            calibrationCamera.addCandidateImagePoints();
+                            calibrationCamera.addCandidateObjectPoints();
+                            calibrationCamera.addCandidateBoardPose();
+                            
+                            // add to PROJECTOR board list (for projector recalibration and stereo calibration):
+                            calibrationProjector.addCandidateImagePoints();
+                            calibrationProjector.addCandidateObjectPoints();
+                            // Note: the rotation and translation vectors for the projector are not yet added: these CANNOT 
+                            // properly be computed using PnP algorithm (as calibrationProjector.computeCandidateBoardPose()), because we are 
+                            // precisely trying to get the projector instrinsics! This will be done by the projector.calibrate() method...
+                            
+                            cout << "Re-calibrating projector..." << endl;
+                            // PUT THIS IN ANOTHER THREAD????
+                            calibrationProjector.calibrate(); // this will recompute the projector instrinsics, as well as the board translation and rotation for all the boards - including the latest one. NOTE: it will also update the candidateBoardRotation and candidateBoardTranslation just because we may want these matrices for drawing (but we don't need to "add" them to the vector lists, because this is already done by the openCV calibration method). 
+                            cout << "Projector re-calibrated." << endl;
+                            
+                            
+                            // Cleaning: this needs to be done SIMULTANEOUSLY for projector and camera. 
+                            // However, the test is only done on the projector reprojection error if the camera intrinsics are fixed (because the 
+                            // stereo calibration will be done by generating image points for the camera based only on the OBJECT POINTS OF THE PROJECTOR)
+                            if(calibrationProjector.size() > startCleaningProjector) {
+                                calibrationProjector.simultaneousClean(calibrationCamera, maxErrorProjector);
+                            }
+                            
+                            // Now we can run the stereo calibration (output: rotCamToProj and transCamToProj). Note: we call stereo calibration
+                            // with FIXED INTRINSICS for both the camera and projector. 
+                            // NOTE: perhaps we can start running this after a few projector calibrations????
+                            cout << "Performing stereo calibration..." << endl;
+                            calibrationProjector.stereoCalibrationCameraProjector(calibrationCamera, rotCamToProj, transCamToProj);
+                            cout << "Stereo Calibration performed." << endl;
+                            
+                            // Everything went fine: go to AR MODE if we finished calibration, or revert to PHASE 1 (and indicate that a "stereo board" was properly aquired)    
+                            
+                            if (calibrationProjector.size()>minNumGoodBoards) {
+                                // SAVE THE INTRINSICS and EXTRINSINCS when TOTAL reprojection error is lower than a certain threshold (this is 
+                                // automatically assured if we called simultaneousClean before this lines of code), 
+                                // and when we get a sufficiently large amount of boards, and move to AR_DEMO:
+                                calibrationProjector.save("calibrationProjector.yml"); 
+                                saveExtrinsics("CameraProjectorExtrinsics.yml");
+                                stateCalibration=AR_DEMO; 
+                            } else {
+                                // Otherwise, proceed refining the calibration:
+                                stateCalibration=CAMERA_AND_PROJECTOR_PHASE1; 
+                                newBoardAquired=true;
+                                cout << endl << "======= YOU CAN MOVE THE PRINTED PATTERN TO EXPLORE IMAGE SPACE =====" << endl; 
+                                lastTime = curTime;
+                                manualGetImage=false;
+                            }
+                            
+                        }  
+                        else {
+                            cout << "Projected pattern not visible!" << endl;
+                            cout << "You need to move the board so that the PROJECTED pattern is visible too." << endl; 
+                            // REVERT TO PHASE1
                             stateCalibration=CAMERA_AND_PROJECTOR_PHASE1; 
-                            newBoardAquired=true;
-                            cout << endl << "======= YOU CAN MOVE THE PRINTED PATTERN TO EXPLORE IMAGE SPACE =====" << endl; 
-                            lastTime = curTime;
+                            // No need to reset manual acquisition or timer, because we are looking for something new. But we may want, in
+                            // case of manual mode, to be able to fix the board before hit a key:
+                            manualGetImage=false; 
                         }
                         
-                    }  else {
-                        cout << "Projected pattern not visible" << endl;
-                        // REVERT TO PHASE1 (in the meanwhile, the user moved the printed pattern, then changing the projected dynamic pattern):
+                    } else {
+                        cout << "Printed pattern not visible!" << endl;
+                        cout << "You need to move the board so that the PRINTED pattern is visible." << endl;
+                        // REVERT TO PHASE1:
                         stateCalibration=CAMERA_AND_PROJECTOR_PHASE1; 
-                        cout << endl << "======= YOU *NEED* TO MOVE THE PRINTED PATTERN =====" << endl; 
+                        // No need to reset manual acquisition or timer, because we are looking for something new. But we may want, in
+                        // case of manual mode, to be able to fix the board before hit a key:
+                        manualGetImage=false; 
                     }
                     
-                } else {
-                    // just revert to phase 1 again:
-                    // REVERT TO PHASE1 (in the meanwhile, the user moved the printed pattern, then changing the projected dynamic pattern):
-                    stateCalibration=CAMERA_AND_PROJECTOR_PHASE1; 
-                    cout << endl << "======= STAY STILL IF YOU WANT TO ACQUIRE THE PROJECTOR IMAGE =====" << endl; 
+                } 
+                else { // this means that the timer or image difference is not yet enough, or we didn't choose to manually acquire
+                    // the image: just move to phase one to continue the moving the board around. 
+                     stateCalibration=CAMERA_AND_PROJECTOR_PHASE1; 
+    
                 }
                 break;
                 
@@ -391,6 +456,12 @@ void testApp::draw() {
     calibrationCamera.drawPreprocessedImage(CAM_WIDTH, 0, CAM_WIDTH/2, CAM_HEIGHT/2);
     calibrationProjector.drawPreprocessedImage(CAM_WIDTH, CAM_HEIGHT/2, CAM_WIDTH/2, CAM_HEIGHT/2);
     
+    // Signal the acquisition of a new board:
+    if (newBoardAquired) {
+        drawHighlightString(" *** NEW BOARD ACQUIRED ***", CAM_WIDTH+20, CAM_HEIGHT-40, cyanPrint,  ofColor(255));
+    }
+    
+    
     // Draw detected points (for CAMERA CALIBRATION BOARD):
     calibrationCamera.drawCandidateImagePoints(0,0, CAM_WIDTH, CAM_HEIGHT, ofColor(255,0,0));
     // Draw reprojected points (for CAMERA CALIBRATION BOARD):
@@ -409,7 +480,6 @@ void testApp::draw() {
     drawHighlightString(intrinsicsProjector.str(), posTextX, posTextY+50, yellowPrint, ofColor(0));
     drawHighlightString("Reproj error projector: " + ofToString(calibrationProjector.getReprojectionError()) + " from " + ofToString(calibrationProjector.size()), posTextX, posTextY+70, magentaPrint);
     
-    
     switch(stateCalibration) {
         case CAMERA_ONLY:
             drawHighlightString(" *** CALIBRATING CAMERA ***", COMPUTER_DISP_WIDTH-300, 40, cyanPrint,  ofColor(255));
@@ -417,6 +487,12 @@ void testApp::draw() {
         case CAMERA_AND_PROJECTOR_PHASE1:
         case CAMERA_AND_PROJECTOR_PHASE2:
             drawHighlightString(" *** CALIBRATING CAMERA + PROJECTOR ***", COMPUTER_DISP_WIDTH-400, 40, cyanPrint,  ofColor(255));
+            
+            if (dynamicProjection) 
+                drawHighlightString("Using DYNAMIC Projection", COMPUTER_DISP_WIDTH-400, 60, cyanPrint,  ofColor(255));
+            else 
+                drawHighlightString("Using FIXED Projection", COMPUTER_DISP_WIDTH-400, 60, cyanPrint,  ofColor(255));
+            
             
             // Extrinsics camera-projector:
             // NOTE: in the future, the object STEREO should have a flag "isReady" to test if it is possible to proceed with some things...
@@ -427,8 +503,8 @@ void testApp::draw() {
                 Mat rotCamToProj3x3;
                 Rodrigues(rotCamToProj, rotCamToProj3x3);
                 for (int i=0; i<3; i++) {
-                    for (int j=0; j<3; j++)  extrinsics += ofToString(rotCamToProj3x3.at<double>(i,j),1) + "  "; 
-                    extrinsics += ofToString(transCamToProj.at<double>(0,i),4)+" \n";
+                    for (int j=0; j<3; j++)  extrinsics += ofToString(rotCamToProj3x3.at<double>(i,j),3) + "  "; 
+                    extrinsics += ofToString(transCamToProj.at<double>(0,i),3)+" \n";
                 }
                 drawHighlightString(extrinsics, posTextX, posTextY+100, yellowPrint, ofColor(0));
                 
@@ -540,20 +616,20 @@ void testApp::draw() {
                           finalR, finalT); 
                 applyMatrix(makeMatrix(finalR, finalT));
                 ofScale(calibrationCamera.myPatternShape.squareSize, calibrationCamera.myPatternShape.squareSize, 0);
+                
                 //Draw something (image, whatever):
                 ofSetColor(0,255,0); ofNoFill();
                 ofSetLineWidth(2);
                 ofRect(0,0,calibrationCamera.myPatternShape.getPatternSize().width-1, calibrationCamera.myPatternShape.getPatternSize().height-1);
-                
-                
+            
+#ifdef MOVIE_PLAY
                 // Draw small images on the white squares of the chessboard:
-                /*
                 ofSetColor(255);
                 for(int i = 0; i < calibrationCamera.myPatternShape.patternSize.height-1; i++)
-					for(int j = 0; j < calibrationCamera.myPatternShape.patternSize.width/2-1+i%2; j++) {
+                    for(int j = 0; j < calibrationCamera.myPatternShape.patternSize.width/2-1+i%2; j++) {
                         eyeMovie.draw(j*2+(i+1)%2,i,1,1); // note: ofScale ensures that each square is normalized
                     }
-                */
+#endif
                 
                 //(b) ========================= Draw using OpenCV =========================
                 // (just for checking compatibility). Note: if we draw circles, the circles would NOT be in perspective here!
@@ -568,7 +644,6 @@ void testApp::draw() {
                 ofSetLineWidth(5);
                 ofSetColor(255, 255, 255);
                 ofRect(0,0, viewportProjector.width, viewportProjector.height);
-
                 
                 // Project all corners of the printed chessboard using EXTRINSICS:
                 vector<Point2f> testPoints;
@@ -584,7 +659,7 @@ void testApp::draw() {
                 ofLine(testPoints[0].x, testPoints[0].y, testPoints[1].x, testPoints[1].y);
                 ofSetColor(0, 255, 255);
                 ofLine(testPoints[0].x, testPoints[0].y, testPoints[3].x, testPoints[3].y);
-                
+
             }
             break;
             
@@ -630,12 +705,13 @@ void testApp::keyPressed(int key) {
     if(key == '2') {initialization(CAMERA_AND_PROJECTOR_PHASE1);}
     if(key == '3') {initialization(AR_DEMO);}
     
-	if(key == ' ') active = !active; 
+    if (key == 'm') manualAcquisition=!manualAcquisition;
+	if (key == ' ') manualGetImage = !manualGetImage; 
     
     if (key=='p') dynamicProjection=!dynamicProjection; // toggle between fixed or dynamic (following) projection. 
     if (key=='o') dynamicProjectionInside=!dynamicProjectionInside;
     
-    if (key== OF_KEY_RETURN) displayAR=!displayAR; // this is just for test to see how it is going. But better not to use during 
+    if (key=='d') displayAR=!displayAR; // this is just for test to see how it is going. But better not to use during 
     // calibration, because it interferes with the detection. 
 }
 
